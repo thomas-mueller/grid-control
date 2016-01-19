@@ -12,7 +12,7 @@
 #-#  See the License for the specific language governing permissions and
 #-#  limitations under the License.
 
-import os, re, sys, glob, stat, time, Queue, fnmatch, logging, tarfile, operator, threading
+import os, re, sys, glob, stat, time, Queue, shutil, fnmatch, logging, tarfile, operator, threading
 from grid_control.gc_exceptions import InstallationError, RuntimeError, UserError
 from grid_control.utils.parsing import parseBool, parseDict, parseInt, parseList, parseStr, parseTime, parseType, strGuid, strTime, strTimeShort
 from grid_control.utils.thread_tools import TimeoutException, hang_protection
@@ -82,6 +82,21 @@ def ensureDirExists(dn, name = 'directory'):
 			os.makedirs(dn)
 		except Exception:
 			raise RuntimeError('Problem creating %s "%s"' % (name, dn))
+
+# Function to force moving a directory
+def forceMove(source, target):
+	try:
+		if os.path.exists(target):
+			shutil.rmtree(target)
+	except IOError, e:
+		eprint('Warning: "%s" cannot be removed: %s' % (target, str(e)))
+		return False
+	try:
+		shutil.move(source, target)
+	except IOError, e:
+		eprint('Warning: Error moving job output directory from "%s" to "%s": %s' % (source, target, str(e)))
+		return False
+	return True
 
 
 def freeSpace(dn, timeout = 5):
