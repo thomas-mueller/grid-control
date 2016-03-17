@@ -15,8 +15,11 @@
 import os, math, stat, time
 from grid_control.config import ConfigError
 from grid_control.gc_exceptions import RuntimeError
-from grid_control.utils import LoggedProcess, eprint, resolveInstallPath, vprint
+from grid_control.utils import eprint, resolveInstallPath, vprint
 from hpfwk import AbstractError, NestedException, Plugin
+
+class LoggedProcess:
+	pass
 
 class TimeoutError(NestedException):
 	pass

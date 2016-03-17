@@ -28,9 +28,12 @@ import time
 
 # GC modules
 from grid_control.gc_exceptions import InstallationError, RuntimeError
-from grid_control.utils import InstallationError, LoggedProcess, ensureDirExists, resolveInstallPath
+from grid_control.utils import ensureDirExists, resolveInstallPath
 from hpfwk import AbstractError, Plugin
 from python_compat import lru_cache
+
+class LoggedProcess:
+	pass
 
 # Container to call commands in a generic fashion
 class CommandContainer(object):
