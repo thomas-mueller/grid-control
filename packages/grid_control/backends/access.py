@@ -14,9 +14,10 @@
 
 # Generic base class for authentication proxies GCSCF:
 
-import os, time, logging
+import time, logging
 from grid_control import utils
 from grid_control.gc_exceptions import UserError
+from grid_control.utils.file_objects import VirtualFile
 from hpfwk import AbstractError, NamedPlugin, NestedException
 from python_compat import rsplit
 
@@ -26,6 +27,9 @@ class AccessTokenError(NestedException):
 class AccessToken(NamedPlugin):
 	configSections = NamedPlugin.configSections + ['proxy', 'access']
 	tagName = 'access'
+	def __init__(self, config, name, oslayer):
+		NamedPlugin.__init__(self, config, name)
+		self._oslayer = oslayer
 
 	def getUsername(self):
 		raise AbstractError
@@ -44,8 +48,8 @@ class AccessToken(NamedPlugin):
 
 
 class MultiAccessToken(AccessToken):
-	def __init__(self, config, name, subtokenBuilder):
-		AccessToken.__init__(self, config, name)
+	def __init__(self, config, name, oslayer, subtokenBuilder):
+		AccessToken.__init__(self, config, name, oslayer)
 		self._subtokenList = map(lambda tbuilder: tbuilder.getInstance(), subtokenBuilder)
 
 	def getUsername(self):
@@ -71,13 +75,13 @@ class TrivialAccessToken(AccessToken):
 
 	def getUsername(self):
 		for var in ('LOGNAME', 'USER', 'LNAME', 'USERNAME'):
-			result = os.environ.get(var)
+			result = self._oslayer.environ.get(var)
 			if result:
 				return result
 		raise AccessTokenError('Unable to determine username!')
 
 	def getGroup(self):
-		return os.environ.get('GROUP', 'None')
+		return self._oslayer.environ.get('GROUP', 'None')
 
 	def getAuthFiles(self):
 		return []
@@ -87,8 +91,8 @@ class TrivialAccessToken(AccessToken):
 
 
 class TimedAccessToken(AccessToken):
-	def __init__(self, config, name):
-		AccessToken.__init__(self, config, name)
+	def __init__(self, config, name, oslayer):
+		AccessToken.__init__(self, config, name, oslayer)
 		self._lowerLimit = config.getTime('min lifetime', 300, onChange = None)
 		self._maxQueryTime = config.getTime('max query time',  5 * 60, onChange = None)
 		self._minQueryTime = config.getTime('min query time', 30 * 60, onChange = None)
@@ -125,9 +129,9 @@ class TimedAccessToken(AccessToken):
 
 
 class VomsProxy(TimedAccessToken):
-	def __init__(self, config, name):
-		TimedAccessToken.__init__(self, config, name)
-		self._infoExec = utils.resolveInstallPath('voms-proxy-info')
+	def __init__(self, config, name, oslayer):
+		TimedAccessToken.__init__(self, config, name, oslayer)
+		self._infoExec = oslayer.findExecutable('voms-proxy-info')
 		self._ignoreWarning = config.getBool('ignore warnings', False, onChange = None)
 		self._cache = None
 
@@ -151,13 +155,12 @@ class VomsProxy(TimedAccessToken):
 		if cached and self._cache:
 			return self._cache
 		# Call voms-proxy-info and parse results
-		proc = utils.LoggedProcess(self._infoExec, '--all')
-		retCode = proc.wait()
+		(retCode, stdout, stderr) = self._oslayer.call(self._infoExec, '--all').finish(None)
 		if (retCode != 0) and not self._ignoreWarning:
-			msg = ('voms-proxy-info output:\n%s\n%s\n' % (proc.getOutput(), proc.getError())).replace('\n\n', '\n')
+			msg = ('voms-proxy-info output:\n%s\n%s\n' % (stdout, stderr)).replace('\n\n', '\n')
 			msg += 'If job submission is still possible, you can set [access] ignore warnings = True\n'
 			raise AccessTokenError(msg + 'voms-proxy-info failed with return code %d' % retCode)
-		self._cache = utils.DictFormat(':').parse(proc.getOutput())
+		self._cache = utils.DictFormat(':').parse(stdout)
 		return self._cache
 
 	def _getProxyInfo(self, key, parse = lambda x: x, cached = True):
@@ -169,8 +172,8 @@ class VomsProxy(TimedAccessToken):
 
 
 class RefreshableAccessToken(TimedAccessToken):
-	def __init__(self, config, name):
-		TimedAccessToken.__init__(self, config, name)
+	def __init__(self, config, name, oslayer):
+		TimedAccessToken.__init__(self, config, name, oslayer)
 		self._refresh = config.getTime('access refresh', 60*60, onChange = None)
 
 	def _refreshAccessToken(self):
@@ -186,38 +189,39 @@ class RefreshableAccessToken(TimedAccessToken):
 class AFSAccessToken(RefreshableAccessToken):
 	alias = ['AFSProxy']
 
-	def __init__(self, config, name):
-		RefreshableAccessToken.__init__(self, config, name)
-		self._kinitExec = utils.resolveInstallPath('kinit')
-		self._klistExec = utils.resolveInstallPath('klist')
+	def __init__(self, config, name, oslayer):
+		assert(oslayer._standalone) # FIXME: Setting up environment for future calls is not yet supported!
+		RefreshableAccessToken.__init__(self, config, name, oslayer)
+		execDict = oslayer.findExecutables(['kinit', 'klist'], first = True)
+		self._kinitExec = execDict['kinit']
+		self._klistExec = execDict['klist']
 		self._cache = None
 		self._authFiles = dict(map(lambda name: (name, config.getWorkPath('proxy.%s' % name)), ['KRB5CCNAME', 'KRBTKFILE']))
 		self._backupTickets(config)
 		self._tickets = config.getList('tickets', [], onChange = None)
 
 	def _backupTickets(self, config):
-		import stat, shutil
+		import os, stat
+		assert(self._oslayer.standalone) # FIXME: Setting up environment for future calls is not yet supported!
 		for name in self._authFiles: # store kerberos files in work directory for persistency
 			if name in os.environ:
 				fn = os.environ[name].replace('FILE:', '')
 				if fn != self._authFiles[name]:
-					shutil.copyfile(fn, self._authFiles[name])
+					self._oslayer.writeFile(self._authFiles[name], VirtualFile(name, self._oslayer.readFile(fn)))
 				os.chmod(self._authFiles[name], stat.S_IRUSR | stat.S_IWUSR)
 				os.environ[name] = self._authFiles[name]
 
 	def _refreshAccessToken(self):
-		return utils.LoggedProcess(self._kinitExec, '-R').wait()
+		return self._oslayer.call(self._kinitExec, '-R').finish(None)
 
 	def _parseTickets(self, cached = True):
 		# Return cached results if requested
 		if cached and self._cache:
 			return self._cache
 		# Call klist and parse results
-		proc = utils.LoggedProcess(self._klistExec)
-		retCode = proc.wait()
 		self._cache = {}
 		try:
-			for line in proc.getOutput().splitlines():
+			for line in self._oslayer.call(self._klistExec).iter_stdout(None):
 				if line.count('@') and (line.count(':') > 1):
 					issued_expires, principal = rsplit(line, '  ', 1)
 					issued_expires = issued_expires.replace('/', ' ').split()

@@ -12,6 +12,7 @@
 #-#  See the License for the specific language governing permissions and
 #-#  limitations under the License.
 
+from grid_control.backends.aspect_base import WMS_Aspect
 from grid_control.backends.broker import Broker
 from grid_control.backends.wms import WMS
 from grid_control.utils import Result
@@ -19,14 +20,15 @@ from grid_control.utils import Result
 # Distribute to WMS according to job id prefix
 
 class MultiWMS(WMS):
-	def __init__(self, config, wmsName, wmsList):
-		WMS.__init__(self, config, wmsName)
-		self._defaultWMS = wmsList[0].getInstance()
+	def __init__(self, config, wmsName, wmsList, oslayer):
+		WMS.__init__(self, config, wmsName, oslayer)
+		# Load submodules and determine timing
+		self._defaultWMS = wmsList[0].getInstance(oslayer)
 		defaultT = self._defaultWMS.getTimings()
 		self._timing = Result(waitOnIdle = defaultT.waitOnIdle, waitBetweenSteps = defaultT.waitBetweenSteps)
 		self._wmsMap = {self._defaultWMS.getObjectName().lower(): self._defaultWMS}
 		for wmsEntry in wmsList[1:]:
-			wmsObj = wmsEntry.getInstance()
+			wmsObj = wmsEntry.getInstance(oslayer)
 			self._wmsMap[wmsObj.getObjectName().lower()] = wmsObj
 			wmsT = wmsObj.getTimings()
 			self._timing.waitOnIdle = max(self._timing.waitOnIdle, wmsT.waitOnIdle)
@@ -48,46 +50,50 @@ class MultiWMS(WMS):
 
 
 	def getAccessToken(self, gcID):
-		return self._wmsMap.get(self._splitId(gcID)[0], self._defaultWMS).getAccessToken(gcID)
+		return self._wmsMap.get(WMS_Aspect.parseID(gcID)[0], self._defaultWMS).getAccessToken(gcID)
 
 
-	def deployTask(self, task, monitor):
-		self._defaultWMS.deployTask(task, monitor)
-		for wmsPrefix, wmsObj in self._wmsMap.items():
-			wmsObj.deployTask(task, monitor)
-
-
-	def submitJobs(self, jobNumList, task):
+	def submitJobs(self, jobNumList, packageManager):
 		def brokerJobs(jobNum):
 			jobReq = self._brokerWMS.brokerAdd(task.getRequirements(jobNum), WMS.BACKEND)
 			return dict(jobReq).get(WMS.BACKEND)[0]
-		return self._forwardCall(jobNumList, brokerJobs, lambda wmsObj, args: wmsObj.submitJobs(args, task))
+		return self._forwardCall(jobNumList, brokerJobs,
+			lambda wmsObj, args: wmsObj.submitJobs(args, packageManager))
 
 
-	def checkJobs(self, ids):
-		return self._forwardCall(ids, lambda (wmsId, jobNum): self._splitId(wmsId)[0], lambda wmsObj, args: wmsObj.checkJobs(args))
+	def checkJobs(self, gcID_jobNum_List, stateNotFound):
+		return self._forwardCall(gcID_jobNum_List,
+			lambda (gcID, jobNum): WMS_Aspect.parseID(gcID)[0],
+			lambda wmsObj, args: wmsObj.checkJobs(args, stateNotFound))
 
 
-	def retrieveJobs(self, ids):
-		return self._forwardCall(ids, lambda (wmsId, jobNum): self._splitId(wmsId)[0], lambda wmsObj, args: wmsObj.retrieveJobs(args))
+	def cancelJobs(self, gcID_jobNum_List):
+		return self._forwardCall(gcID_jobNum_List,
+			lambda (gcID, jobNum): WMS_Aspect.parseID(gcID)[0],
+			lambda wmsObj, args: wmsObj.cancelJobs(args))
 
 
-	def cancelJobs(self, ids):
-		return self._forwardCall(ids, lambda (wmsId, jobNum): self._splitId(wmsId)[0], lambda wmsObj, args: wmsObj.cancelJobs(args))
+	def retrieveJobs(self, gcID_jobNum_List, packageManager):
+		return self._forwardCall(gcID_jobNum_List,
+			lambda (gcID, jobNum): WMS_Aspect.parseID(gcID)[0],
+			lambda wmsObj, args: wmsObj.retrieveJobs(args, packageManager))
 
+	# Classify all elements of list "args" using the "assignFun"
+	def _getMapBackend2Args(self, args, assignFun):
+		result = {}
+		for arg in args:
+			backendName = assignFun(arg)
+			if not backendName:
+				backendName = self._defaultWMS.wmsName # assignFun(arg) not valid => default backend
+			elif backendName.lower() not in self._wmsMap:
+				backendName = self._defaultWMS.wmsName # assignFun(arg) not setup => default backend
+			result.setdefault(backendName.lower(), []).append(arg)
+		# Return dictionary with mapping: backend names => list of backend arguments
+		return result
 
-	def _getMapID2Backend(self, args, assignFun):
-		argMap = {}
-		for arg in args: # Assign args to backends
-			backend = assignFun(arg)
-			if not backend:
-				backend = self._defaultWMS.wmsName
-			argMap.setdefault(backend.lower(), []).append(arg)
-		return argMap
-
-
+	# call "callFun" with args
 	def _forwardCall(self, args, assignFun, callFun):
-		argMap = self._getMapID2Backend(args, assignFun)
+		argMap = self._getMapBackend2Args(args, assignFun)
 		for wmsPrefix in filter(lambda wmsPrefix: wmsPrefix in argMap, self._wmsMap):
 			wms = self._wmsMap[wmsPrefix]
 			for result in callFun(wms, argMap[wmsPrefix]):

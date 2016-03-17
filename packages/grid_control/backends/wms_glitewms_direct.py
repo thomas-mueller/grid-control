@@ -14,11 +14,12 @@
 
 import os, sys
 
-glite = os.environ.get('GLITE_WMS_LOCATION', os.environ.get('GLITE_LOCATION', ''))
+glite_path = os.environ.get('GLITE_WMS_LOCATION', os.environ.get('GLITE_LOCATION', ''))
 for p in ['lib', 'lib64', os.path.join('lib', 'python'), os.path.join('lib64', 'python')]:
-	sys.path.append(os.path.join(glite, p))
+	sys.path.append(os.path.join(glite_path, p))
 
 from grid_control import utils
+from grid_control.backends.aspect_check import WMS_CheckAspect
 from grid_control.backends.wms import BackendError
 from grid_control.backends.wms_glitewms import GliteWMS
 
@@ -26,7 +27,10 @@ try: # gLite 3.2
 	import wmsui_api
 	glStates = wmsui_api.states_names
 	def getStatusDirect(wmsId):
-		jobStatus = wmsui_api.getStatusDirect(wmsui_api.getJobIdfromList([wmsId])[0], 0)
+		try: # new parameter json
+			jobStatus = wmsui_api.getStatus(wmsui_api.getJobIdfromList(None, [wmsId])[0], 0)
+		except:
+			jobStatus = wmsui_api.getStatus(wmsui_api.getJobIdfromList([wmsId])[0], 0)
 		return map(lambda name: (name.lower(), jobStatus.getAttribute(glStates.index(name))), glStates)
 except Exception: # gLite 3.1
 	try:
@@ -35,7 +39,7 @@ except Exception: # gLite 3.1
 		wrStatus = Status()
 		jobStatus = Job.JobStatus(wrStatus)
 		def getStatusDirect(wmsId):
-			wrStatus.getStatusDirect(wmsId, 0)
+			wrStatus.getStatus(wmsId, 0)
 			err, apiMsg = wrStatus.get_error()
 			if err:
 				raise BackendError(apiMsg)
@@ -44,30 +48,27 @@ except Exception: # gLite 3.1
 	except Exception:
 		getStatusDirect = None
 
+class GliteWMSDirect_CheckAspect(WMS_CheckAspect):
+	# Check status of jobs and yield (jobNum, gcID, jobStatus, jobInfos)
+	def checkJobs(self, gcID_jobNum_List, stateNotFound):
+		wmsID_gcID_Map = self._mapIDs(gcID_jobNum_List)
+		gcID_jobNum_Map = dict(gcID_jobNum_List)
+
+		for wmsID in wmsID_gcID_Map:
+			data = utils.filterDict(dict(getStatusDirect(wmsID)), vF = lambda v: (v != '') and (v != '0'))
+			data['dest'] = data.get('destination', 'N/A')
+			gcID = wmsID_gcID_Map.get(data['jobid'])
+			if gcID:
+				yield (gcID_jobNum_Map.pop(gcID), gcID, Grid_CheckAspect.statusMap.get(data['status'].lower(), stateNotFound), data)
+			if utils.abort():
+				break
+
+		for gcID in gcID_jobNum_Map: # If status check didn't give results, assume the job has finished
+			yield (gcID_jobNum_Map[gcID], gcID, stateNotFound, {})
+
 class GliteWMSDirect(GliteWMS):
-	# Check status of jobs and yield (jobNum, wmsID, status, other data)
-	def checkJobs(self, ids):
+	def __init__(self, config, name, oslayer):
+		check = None
 		if getStatusDirect:
-			return self.checkJobsDirect(ids)
-		return GliteWMS.checkJobs(self, ids)
-
-
-	def checkJobsDirect(self, ids):
-		if len(ids) == 0:
-			raise StopIteration
-
-		activity = utils.ActivityLog('checking job status')
-		errors = []
-		for (wmsId, jobNum) in ids:
-			try:
-				data = utils.filterDict(dict(getStatusDirect(self._splitId(wmsId)[0])), vF = lambda v: (v != '') and (v != '0'))
-				data['id'] = self._createId(data.get('jobid', wmsId))
-				data['dest'] = data.get('destination', 'N/A')
-				yield (jobNum, data['id'], self._statusMap[data['status'].lower()], data)
-			except Exception:
-				errors.append(repr(sys.exc_info()[1]))
-				if utils.abort():
-					break
-		del activity
-		if errors:
-			utils.eprint('The following glite errors have occured:\n%s' % str.join('\n', errors))
+			check = GliteWMSDirect_CheckAspect(config, name, oslayer)
+		GliteWMS.__init__(self, config, name, oslayer, check)

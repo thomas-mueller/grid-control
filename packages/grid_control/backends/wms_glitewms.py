@@ -12,9 +12,10 @@
 #-#  See the License for the specific language governing permissions and
 #-#  limitations under the License.
 
-import os, time, random, tempfile
+import os, time, random
 from grid_control import utils
-from grid_control.backends.wms_grid import GridWMS
+from grid_control.backends.lcg import LCG_RequirementAspect_CE, LCG_RequirementAspect_Sites, LCG_RequirementAspect_WMS
+from grid_control.backends.wms_grid import GridWMS, Grid_SubmitAspect
 from grid_control.gc_exceptions import RuntimeError
 from python_compat import md5
 
@@ -23,6 +24,10 @@ def choice_exp(sample, p = 0.5):
 		if random.random() < p:
 			return x
 	return sample[-1]
+
+class GliteWMS_RequirementAspect_WMS():
+	def __init__(self, config, oslayer):
+		pass
 
 class DiscoverWMS_Lazy: # TODO: Move to broker infrastructure
 	def __init__(self, config):
@@ -53,27 +58,23 @@ class DiscoverWMS_Lazy: # TODO: Move to broker infrastructure
 		utils.PersistentDict(self.statePath, ' = ').write(tmp)
 
 	def listWMS_all(self):
-		result = []
-		for line in utils.LoggedProcess(self._exeLCGInfoSites, 'wms').iter():
-			result.append(line.strip())
+		result = map(str.strip, utils.LocalProcess(self._exeLCGInfoSites, 'wms').iter_stdout(None))
 		random.shuffle(result)
 		return result
 
 	def matchSites(self, endpoint):
-		result = []
-		checkArgs = '-a' 
+		checkArgs = ['-a']
 		if endpoint:
-			checkArgs += ' -e %s' % endpoint
-		proc = utils.LoggedProcess(self._exeGliteWMSJobListMatch, checkArgs + ' %s' % utils.pathShare('null.jdl'))
-		def matchThread(): # TODO: integrate timeout into loggedprocess
-			for line in proc.iter():
+			checkArgs.extend(['-e', endpoint])
+		checkArgs.append(utils.pathShare('null.jdl'))
+		proc = utils.LocalProcess(self._exeGliteWMSJobListMatch, *checkArgs)
+		result = []
+		try:
+			for line in proc.iter_stdout(timeout = 3):
 				if line.startswith(' - '):
 					result.append(line[3:].strip())
-		thread = utils.gcStartThread('Matching jobs with WMS %s' % endpoint, matchThread)
-		thread.join(timeout = 3)
-		if thread.isAlive():
+		except ProcessTimeout:
 			proc.kill()
-			thread.join()
 			self.wms_timeout[endpoint] = self.wms_timeout.get(endpoint, 0) + 1
 			if self.wms_timeout.get(endpoint, 0) > 10: # remove endpoints after 10 failures
 				self.wms_all.remove(endpoint)
@@ -123,64 +124,74 @@ class DiscoverWMS_Lazy: # TODO: Move to broker infrastructure
 		return result
 
 
+DelegateMode = utils.makeEnum(['force', 'auto', 'never'])
+
+class GliteWMS_SubmitAspect(Grid_SubmitAspect):
+	def __init__(self, config, name, oslayer):
+		Grid_SubmitAspect.__init__(self, config, name, oslayer, oslayer.findExecutable('glite-wms-job-submit'))
+		self._delegate = {}
+		self._delegateExec = None
+		self._delegateMode = config.getEnum('proxy delegation', DelegateMode, DelegateMode.force, onChange = None)
+		if self._delegateMode != DelegateMode.never:
+			self._delegateExec = oslayer.findExecutable('glite-wms-job-delegate-proxy')
+		self._useDelegate = config.getBool('try delegate', True, onChange = None)
+		self._forceDelegate = config.getBool('force delegate', False, onChange = None)
+
+	def delegateProxy(self, endpoint, timeout = 10):
+		activity = utils.ActivityLog('creating delegate proxy for job submission')
+		dID = dID = 'GCD' + md5(str(time.time())).hexdigest()[:10]
+		args = [self._delegateExec, '-d', dID, '--noint']
+		if self._configFile:
+			args.extend(['--config', self._configFile])
+		if endpoint:
+			args.extend(['-e', endpoint])
+		proc = self._oslayer.call(*args)
+		proc.status(timeout, terminate = True)
+		proc_out = proc.read_stdout(0)
+		if ('glite-wms-job-delegate-proxy Success' in proc_out) and (dID in proc_out):
+			return dID
+		self._log.warning('Unable to delegate proxy!')
+		self._log.log_process_result(proc)
+
+	# Get list with submission arguments - jobScriptPath points to the jdl
+	def _submitArguments(self, jobName, jobRequirements, jobFile, userOpts):
+		result = [self._submitExec, '--noint', '--debug', '--logfile', '/dev/stderr']
+		if self._configFile:
+			result.extend(['--config', self._configFile])
+		# WMS endpoint setup
+		endpoint = None
+		endpointList = self._getRequirementValue(jobRequirements, GridWMS.ENDPOINT)
+		if endpointList:
+			endpoint = endpointList[0]
+		if endpoint:
+			result.extend(['-e', endpoint])
+		# Proxy delegation
+		if (self._delegateMode != DelegateMode.never) and not self._delegate.get(endpoint):
+			self._delegate[endpoint] = self.delegateProxy(endpoint)
+		if self._delegate[endpoint]:
+			result.extend(['-d', self._delegate[endpoint]])
+		elif self._delegateMode == DelegateMode.force:
+			raise RuntimeError('Unable to delegate proxy!')
+		else:
+			result.append('-a')
+		return result + [jobFile]
+
+
 class GliteWMS(GridWMS):
 	alias = ['grid']
 	configSections = GridWMS.configSections + ['glite-wms', 'glitewms'] # backwards compatibility
 
-	def __init__(self, config, name):
-		GridWMS.__init__(self, config, name)
-
-		self._delegateExec = utils.resolveInstallPath('glite-wms-job-delegate-proxy')
-		self._submitExec = utils.resolveInstallPath('glite-wms-job-submit')
-		self._statusExec = utils.resolveInstallPath('glite-wms-job-status')
-		self._outputExec = utils.resolveInstallPath('glite-wms-job-output')
-		self._cancelExec = utils.resolveInstallPath('glite-wms-job-cancel')
-		self._submitParams.update({'-r': self._ce, '--config': self._configVO})
-		self._useDelegate = config.getBool('try delegate', True, onChange = None)
-		self._forceDelegate = config.getBool('force delegate', False, onChange = None)
-		self._discovery_module = None
-		if config.getBool('discover wms', False, onChange = None):
-			self._discovery_module = DiscoverWMS_Lazy(config)
-		self._discover_sites = config.getBool('discover sites', False, onChange = None)
-
-
-	def getSites(self):
-		if self._discover_sites and self._discovery_module:
-			return self._discovery_module.getSites()
-
-
-	def bulkSubmissionBegin(self):
-		self._submitParams.update({ '-d': None })
-		if self._discovery_module:
-			self._submitParams.update({ '-e': self._discovery_module.getWMS() })
-		if self._useDelegate == False:
-			self._submitParams.update({ '-a': ' ' })
-			return True
-		log = tempfile.mktemp('.log')
-		try:
-			dID = 'GCD' + md5(str(time.time())).hexdigest()[:10]
-			activity = utils.ActivityLog('creating delegate proxy for job submission')
-			proc = utils.LoggedProcess(self._delegateExec, '%s -d %s --noint --logfile "%s"' %
-				(utils.QM(self._configVO, '--config "%s"' % self._configVO, ''), dID, log))
-
-			output = proc.getOutput(wait = True)
-			if ('glite-wms-job-delegate-proxy Success' in output) and (dID in output):
-				self._submitParams.update({ '-d': dID })
-			del activity
-
-			if proc.wait() != 0:
-				proc.logError(self.errorLog, log = log)
-			return (self._submitParams.get('-d', None) != None)
-		finally:
-			utils.removeFiles([log])
-
-
-	def submitJobs(self, jobNumList, module):
-		if not self.bulkSubmissionBegin(): # Trying to delegate proxy failed
-			if self._forceDelegate: # User switched on forcing delegation => exception
-				raise RuntimeError('Unable to delegate proxy!')
-			utils.eprint('Unable to delegate proxy! Continue with automatic delegation...')
-			self._submitParams.update({ '-a': ' ' })
-			self._useDelegate = False
-		for submitInfo in GridWMS.submitJobs(self, jobNumList, module):
-			yield submitInfo
+	def __init__(self, config, name, oslayer, check = None):
+		oslayer.findExecutables(['lcg-infosites', 'glite-wms-job-delegate-proxy',
+			'glite-wms-job-submit', 'glite-wms-job-status',
+			'glite-wms-job-output', 'glite-wms-job-cancel'])
+		GridWMS.__init__(self, config, name, oslayer,
+			submit = GliteWMS_SubmitAspect(config, name, oslayer),
+			check = check,
+			submitExec = 'glite-wms-job-submit', checkExec = 'glite-wms-job-status',
+			cancelExec = 'glite-wms-job-cancel', retrieveExec = 'glite-wms-job-output',
+			brokers = [
+				LCG_RequirementAspect_CE(config, name, oslayer),
+				LCG_RequirementAspect_Sites(config, name, oslayer),
+				LCG_RequirementAspect_WMS(config, name, oslayer),
+			])

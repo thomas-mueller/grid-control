@@ -13,51 +13,54 @@
 #-#  limitations under the License.
 
 from grid_control import utils
+from grid_control.backends.aspect_broker import WMS_RequirementAspect_BrokerDiscovery
+from grid_control.backends.aspect_check import WMS_CheckAspect_Serial_SSP
 from grid_control.backends.wms import BackendError, WMS
-from grid_control.backends.wms_pbsge import PBSGECommon
+from grid_control.backends.wms_local import LocalWMS
+from grid_control.backends.wms_pbsge import PBSGE_SubmitAspect
 from grid_control.job_db import Job
 
-class PBS(PBSGECommon):
-	configSections = PBSGECommon.configSections + ['PBS']
-	_statusMap = {
-		'H': Job.SUBMITTED, 'S': Job.SUBMITTED,
-		'W': Job.WAITING,   'Q': Job.QUEUED,
-		'R': Job.RUNNING,   'C': Job.DONE,
-		'E': Job.DONE,      'T': Job.DONE,
-		'fail':	Job.FAILED, 'success': Job.SUCCESS
-	}
-
-	def __init__(self, config, name):
-		PBSGECommon.__init__(self, config, name)
-		self._nodesExec = utils.resolveInstallPath('pbsnodes')
-		self._server = config.get('server', '', onChange = None)
-		self._fqid = lambda wmsId: utils.QM(self._server, '%s.%s' % (wmsId, self._server), wmsId)
-
-
-	def getSubmitArguments(self, jobNum, jobName, reqs, sandbox, stdout, stderr):
-		reqMap = { WMS.MEMORY: ('pvmem', lambda m: '%dmb' % m) }
-		params = PBSGECommon.getSubmitArguments(self, jobNum, jobName, reqs, sandbox, stdout, stderr, reqMap)
+class PBS_SubmitAspect(PBSGE_SubmitAspect):
+	def _submitArguments(self, jobName, jobRequirements, jobFile, userOpts):
+		params = []
 		# Job requirements
-		if reqs.get(WMS.QUEUES):
-			params += ' -q %s' % reqs[WMS.QUEUES][0]
-		if reqs.get(WMS.SITES):
-			params += ' -l host=%s' % str.join('+', reqs[WMS.SITES])
-		return params
+		queue = self._getRequirementValue(jobRequirements, WMS.QUEUES, [''])[0]
+		if queue:
+			params.extend(['-q', queue])
+		nodes = self._getRequirementValue(jobRequirements, WMS.SITES, None)
+		if nodes:
+			params.extend(['-l', 'host=%s' % str.join('+', nodes)])
 
+		reqMap = { WMS.MEMORY: ('pvmem', lambda m: '%dmb' % m) }
+		return self._submitArgumentsCommon(jobName, jobRequirements, jobFile, userOpts + params, reqMap)
 
-	def parseSubmitOutput(self, data):
+	def _submitParse(self, proc):
 		# 1667161.ekpplusctl.ekpplus.cluster
-		return data.split('.')[0].strip()
+		wmsID = proc.read_stdout(10).split('.')[0].strip()
+		return (wmsID.isdigit(), wmsID)
 
 
-	def parseStatus(self, status):
-		for section in utils.accumulate(status, '', lambda x, buf: x == '\n'):
+class PBS_CheckAspect(WMS_CheckAspect_Serial_SSP):
+	def __init__(self, config, name, oslayer, checkExec, makeFQID):
+		statusMap = {
+			'H': Job.SUBMITTED, 'S': Job.SUBMITTED,
+			'W': Job.WAITING,   'Q': Job.QUEUED,
+			'R': Job.RUNNING,   'C': Job.DONE,
+			'E': Job.DONE,      'T': Job.DONE,
+			'fail':	Job.FAILED, 'success': Job.SUCCESS
+		}
+		WMS_CheckAspect_Serial_SSP.__init__(self, config, name, oslayer, statusMap)
+		self._checkExec = checkExec
+		self._makeFQID = makeFQID
+
+	def _checkArguments(self, wmsIDs):
+		return [self._checkExec, '-f'] + map(self._makeFQID, wmsIDs)
+
+	def _checkParse(self, proc):
+		for section in utils.accumulate(proc.iter_stdout(10), '', lambda x, buf: x == '\n'):
 			try:
 				lines = section.replace('\n\t', '').split('\n')
 				jobinfo = utils.DictFormat(' = ').parse(lines[1:])
-				jobinfo['id'] = lines[0].split(':')[1].split('.')[0].strip()
-				jobinfo['status'] = jobinfo.get('job_state')
-				jobinfo['dest'] = 'N/A'
 				if 'exec_host' in jobinfo:
 					jobinfo['dest'] = '%s/%s' % (
 						jobinfo.get('exec_host').split('/')[0] + '.' + jobinfo.get('server', ''),
@@ -65,22 +68,19 @@ class PBS(PBSGECommon):
 					)
 			except Exception:
 				raise BackendError('Error reading job info:\n%s' % section)
-			yield jobinfo
+			yield (lines[0].split(':')[1].split('.')[0].strip(), jobinfo.get('job_state'), jobinfo)
 
 
-	def getCheckArguments(self, wmsIds):
-		return '-f %s' % str.join(' ', map(self._fqid, wmsIds))
+class PBS_BrokerAspect_Queues(WMS_RequirementAspect_BrokerDiscovery):
+	def __init__(self, config, name, oslayer):
+		WMS_RequirementAspect_BrokerDiscovery.__init__(self, config, name, oslayer, 'queues', 'UserBroker', WMS.QUEUES)
+		self._configExec = oslayer.findExecutable('qconf', ['-sql'])
 
-
-	def getCancelArguments(self, wmsIds):
-		return str.join(' ', map(self._fqid, wmsIds))
-
-
-	def getQueues(self):
+	def discover(self):
 		(queues, active) = ({}, False)
 		keys = [WMS.MEMORY, WMS.CPUTIME, WMS.WALLTIME]
 		parser = dict(zip(keys, [int, utils.parseTime, utils.parseTime]))
-		for line in utils.LoggedProcess(self.statusExec, '-q').iter():
+		for line in self._oslayer.call(self._configExec, '-q').iter_stdout(10):
 			if line.startswith('-'):
 				active = True
 			elif line.startswith(' '):
@@ -92,12 +92,36 @@ class PBS(PBSGECommon):
 		return queues
 
 
-	def getNodes(self):
+class PBS_BrokerAspect_Nodes(WMS_RequirementAspect_BrokerDiscovery):
+	def __init__(self, config, name, oslayer):
+		WMS_RequirementAspect_BrokerDiscovery.__init__(self, config, name, oslayer, 'queues', 'UserBroker', WMS.QUEUES)
+		self._nodesExec = oslayer.findExecutable('pbsnodes')
+
+	def discover(self):
 		result = []
-		for line in utils.LoggedProcess(self._nodesExec).iter():
+		for line in self._oslayer.call(self._nodesExec).iter_stdout(10):
 			if not line.startswith(' ') and len(line) > 1:
 				node = line.strip()
 			if ('state = ' in line) and ('down' not in line) and ('offline' not in line):
 				result.append(node)
 		if len(result) > 0:
 			return result
+
+
+class PBS(LocalWMS):
+	configSections = LocalWMS.configSections + ['PBS']
+
+	def __init__(self, config, name, oslayer):
+		self._server = config.get('server', '', onChange = None)
+		makeFQID = lambda wmsID: utils.QM(self._server, '%s.%s' % (wmsID, self._server), wmsID)
+
+		execDict = oslayer.findExecutables(['qsub', 'qstat', 'qdel', 'qconf', 'pbsnodes'], first = True)
+		LocalWMS.__init__(self, config, name, oslayer,
+			submit = PBS_SubmitAspect(config, name, oslayer, execDict['qsub']),
+			check = PBS_CheckAspect(config, name, oslayer, execDict['qstat'], makeFQID),
+			cancel = WMS_CancelAspect_SharedFS_LAF(config, name, oslayer,
+				argPrefix = [execDict['qdel']], logBlacklist = ['Unknown Job Id']),
+			retrieve = WMS_RetrieveAspect_Serial_SharedFS(config, name, oslayer),
+			brokers = [
+				PBS_BrokerAspect_Queues(config, name, oslayer),
+				PBS_BrokerAspect_Nodes(config, name, oslayer)])

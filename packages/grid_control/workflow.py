@@ -14,7 +14,7 @@
 
 import logging
 from grid_control import utils
-from grid_control.backends import WMS
+from grid_control.backends import OSLayer, WMS
 from grid_control.config import TaggedConfigView
 from grid_control.gui import GUI
 from grid_control.job_manager import JobManager
@@ -41,8 +41,9 @@ class Workflow(NamedPlugin):
 			cls = Monitoring, tags = [self, self.task]).getInstance(self.task)
 
 		# Initialise workload management interface
+		oslayer = config.getPlugin('wms access', 'Local', cls = OSLayer).getInstance(config)
 		self.wms = config.getCompositePlugin('backend', 'grid', 'MultiWMS',
-			cls = WMS, tags = [self, self.task]).getInstance()
+			cls = WMS, tags = [self, self.task]).getInstance(oslayer)
 
 		# Initialise job database
 		jobManagerCls = config.getPlugin('job manager', 'SimpleJobManager',
